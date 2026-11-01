@@ -45,7 +45,7 @@ def similarity(a, b):
 class AutoAnswerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("工程伦理 - OCR自动答题助手 v3.0 (判断题精准中心优化)")
+        self.root.title("工程伦理 - OCR自动答题助手 v3.2 (防侧边栏干扰防误判)")
         self.root.geometry("510x560")
         self.root.attributes("-topmost", True)  # 默认窗口置顶
 
@@ -263,39 +263,41 @@ class AutoAnswerApp:
         return ocr_items, full_screen_norm, img, (offset_x, offset_y)
 
     def _find_true_false_circles(self, ocr_items, q_left_bottom, q_top_y):
-        """★ 优化：利用 OCR 找勾叉的中心点，找不到再用优化的兜底坐标 ★"""
+        """查找判断题圆圈，加入 X/Y 严格边界过滤"""
         true_pos, false_pos = None, None
+        bx, by = q_left_bottom
 
-        # 1. 优先在题干下方寻找勾/叉的符号
+        # 1. 尝试在题干下方寻找勾/叉/圆圈
         for item in ocr_items:
-            if item['center'][1] < q_top_y:
+            # ★ 关键修复：必须满足以下条件：
+            # Y轴：在题干上方边界之下，且不能超出题干底部太远（超150像素）
+            # X轴：必须在题干文字的最左侧（bx）右侧，以此过滤掉左侧题号栏的绿勾
+            if item['center'][1] < q_top_y or item['center'][1] > by + 150:
+                continue
+            if item['center'][0] < bx - 20:
                 continue
 
             raw = item['raw'].strip().lower()
-            # 限制长度，防止匹配到正文，如字母 v 或 x
             if len(raw) <= 3:
                 if any(c in raw for c in ['√', 'v', '✓', '对', 'y']):
                     true_pos = item['center']
                 elif any(c in raw for c in ['×', 'x', '✗', '错', 'n']):
                     false_pos = item['center']
 
-        # 2. 坐标处理
         if true_pos and false_pos:
-            # 确保左勾右叉（防排版错乱）
             if true_pos[0] > false_pos[0]:
                 true_pos, false_pos = false_pos, true_pos
-            return true_pos, false_pos, "OCR绝对中心定位"
+            return true_pos, false_pos, "OCR精准图案"
         elif true_pos:
-            return true_pos, (true_pos[0] + 55, true_pos[1]), "OCR勾+右边距推算"
+            return true_pos, (true_pos[0] + 54, true_pos[1]), "OCR勾+横向推算"
         elif false_pos:
-            return (false_pos[0] - 55, false_pos[1]), false_pos, "OCR叉+左边距推算"
+            return (false_pos[0] - 54, false_pos[1]), false_pos, "OCR叉+横向推算"
 
-        # 3. 兜底：如果 OCR 完全没识别出图形（可能太淡了）
-        bx, by = q_left_bottom
-        # 微调兜底参数，更贴近正中央
-        true_pos = (bx + 22, by + 42)
-        false_pos = (bx + 72, by + 42)
-        return true_pos, false_pos, "相对位置兜底推算"
+        # 2. 兜底推算（针对空心图标没被OCR识别的情况）
+        # 使用精准的像素级推算
+        true_pos = (bx + 18, by + 55)
+        false_pos = (bx + 72, by + 55)
+        return true_pos, false_pos, "边界兜底推算"
 
     def _click_submit(self):
         if not self.click_submit_var.get() and not self.click_next_var.get():
@@ -352,7 +354,7 @@ class AutoAnswerApp:
         best_match = None
         best_score = 0
 
-        # 1. 匹配题干
+        # 1. 匹配题库
         for item in self.bank:
             q_norm = item['norm_q']
             if not q_norm:
@@ -375,18 +377,27 @@ class AutoAnswerApp:
             self.log(f"[-] 未匹配到题目 (最高相似度: {best_score:.2f})")
             return
 
-        # 2. 定位题干的边界
+        # 2. 精确定位题干边界
         q_norm = best_match['norm_q']
-        q_matched_lines = [
-            it for it in ocr_items
-            if len(it['norm']) >= 2 and (it['norm'] in q_norm or q_norm in it['norm'])
-               and "判断题" not in it['raw'] and "单选题" not in it['raw'] and "多选题" not in it['raw']
-        ]
+        best_line = None
+        best_line_sim = 0
+        for item in ocr_items:
+            if len(item['norm']) >= 4:
+                sim = similarity(q_norm, item['norm'])
+                if sim > best_line_sim:
+                    best_line_sim = sim
+                    best_line = item
 
-        if q_matched_lines:
-            q_left_x = min(it['left_bottom'][0] for it in q_matched_lines)
-            q_bottom_y = max(it['left_bottom'][1] for it in q_matched_lines)
-            q_top_y = min(it['left_bottom'][1] for it in q_matched_lines) - 60
+        if best_line:
+            q_left_x = best_line['left_bottom'][0]
+            q_bottom_y = best_line['left_bottom'][1]
+
+            for item in ocr_items:
+                if item['left_bottom'][1] > q_bottom_y and item['left_bottom'][1] - q_bottom_y < 100:
+                    if abs(item['left_bottom'][0] - q_left_x) < 80:
+                        q_bottom_y = item['left_bottom'][1]
+
+            q_top_y = q_bottom_y - 60
             q_left_bottom = (q_left_x, q_bottom_y)
         else:
             q_left_bottom = (474, 302)
@@ -398,15 +409,14 @@ class AutoAnswerApp:
 
         is_tf = any(ans in ('TRUE', 'FALSE') for ans in best_match['ans_list'])
 
-        # 3. 查找并点击选项
+        # 3. 执行点击
         for target_text, ans_key in best_match['targets']:
             norm_target = normalize_text(target_text)
             clicked = False
             delay_sec = random.uniform(0.3, 0.8)
 
-            # 判断题处理
+            # 判断题
             if ans_key in ('TRUE', 'FALSE'):
-                # 传入 ocr_items 和位置信息
                 true_pos, false_pos, method = self._find_true_false_circles(ocr_items, q_left_bottom, q_top_y)
                 target_pos = true_pos if ans_key == 'TRUE' else false_pos
                 label = "左圆[勾 ✓]" if ans_key == 'TRUE' else "右圆[叉 ×]"
@@ -415,26 +425,29 @@ class AutoAnswerApp:
                 time.sleep(delay_sec)
                 clicked = True
 
-            # 单选/多选题处理
+            # 单选/多选题
             if not clicked and not is_tf:
                 found_pos = None
-                ocr_items.sort(key=lambda item: item['center'][1])  # 按Y轴从上到下排序
+                ocr_items.sort(key=lambda item: item['center'][1])
 
                 # 策略 A：精准寻找独立的字母图标
                 for ocr_item in ocr_items:
-                    if ocr_item['center'][1] < q_top_y:
+                    # ★ 关键修复：X 轴必须大于题干最左侧坐标，防止识别到左侧题号栏里的数字或字母
+                    if ocr_item['center'][1] < q_top_y or ocr_item['center'][0] < q_left_x - 20:
                         continue
                     raw_text = ocr_item['raw'].strip().upper()
                     if len(raw_text) <= 3:
                         clean_letter = re.sub(r'[^A-E]', '', raw_text)
                         if clean_letter == ans_key:
-                            found_pos = (ocr_item['center'][0], ocr_item['center'][1], f"精准字母图标 ({raw_text})")
+                            found_pos = (ocr_item['center'][0], ocr_item['center'][1], f"精准字母")
                             break
 
-                # 策略 B：文字精确匹配 + 左偏移
+                # 策略 B：文字严格匹配
                 if not found_pos and norm_target:
                     for ocr_item in ocr_items:
-                        if not ocr_item['norm'] or ocr_item['center'][1] < q_top_y:
+                        # ★ 关键修复：同样限制 X 轴
+                        if not ocr_item['norm'] or ocr_item['center'][1] < q_top_y or ocr_item['center'][
+                            0] < q_left_x - 20:
                             continue
                         is_exact_match = (norm_target == ocr_item['norm'])
                         is_long_contain = (len(norm_target) > 5 and norm_target in ocr_item['norm'])
@@ -442,10 +455,9 @@ class AutoAnswerApp:
                         if is_exact_match or is_long_contain:
                             target_x = ocr_item['center'][0] - 45
                             target_y = ocr_item['center'][1]
-                            found_pos = (target_x, target_y, f"文字严格匹配 ({ocr_item['raw'][:8]}...)")
+                            found_pos = (target_x, target_y, f"文字匹配")
                             break
 
-                # 执行点击
                 if found_pos:
                     tx, ty, method = found_pos
                     self.log(f"  -> {method} 定位 [{ans_key}] @({tx},{ty}) [间隔{delay_sec:.2f}s]")
@@ -456,7 +468,6 @@ class AutoAnswerApp:
             if not clicked:
                 self.log(f"  [!] 未找到选项 [{ans_key}] 的位置，请手动选择！")
 
-        # 选完选项后，执行提交判断
         self._click_submit()
 
     def trigger_single(self):
