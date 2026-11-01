@@ -1,0 +1,526 @@
+import os
+import re
+import time
+import random
+import ctypes
+import threading
+import unicodedata
+from difflib import SequenceMatcher
+import tkinter as tk
+from tkinter import filedialog, scrolledtext
+import cv2
+import numpy as np
+import pyautogui
+import keyboard
+from PIL import ImageGrab
+from rapidocr_onnxruntime import RapidOCR
+
+# 解决 Windows 125%/150% 缩放导致的截图不全与鼠标点击位置偏移问题
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# ==================== 默认配置 ====================
+DEFAULT_BANK_FILE = "QuestionBank/timu.txt"
+# =================================================
+
+
+def normalize_text(text):
+    """将康熙部首等异体字转换为标准汉字，并去除标点、空格"""
+    if not text:
+        return ""
+    text = unicodedata.normalize('NFKC', text)
+    text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text)
+    return text.lower()
+
+
+def similarity(a, b):
+    """计算两个字符串的相似度"""
+    return SequenceMatcher(None, a, b).ratio()
+
+
+class AutoAnswerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("工程伦理 - OCR自动答题助手 v2.1")
+        self.root.geometry("510x560")
+        self.root.attributes("-topmost", True)  # 默认窗口置顶
+
+        self.ocr = None
+        self.bank = []
+        self.is_running_loop = False
+        self.bank_file_path = tk.StringVar(value=DEFAULT_BANK_FILE)
+        self.topmost_var = tk.BooleanVar(value=True)
+        self.fullscreen_var = tk.BooleanVar(value=True)
+        # 是否自动点击“提交”
+        self.click_submit_var = tk.BooleanVar(value=True)
+        # 默认不点击“下一题”（因为网页点完提交会自动跳转）
+        self.click_next_var = tk.BooleanVar(value=False)
+
+        self._build_ui()
+        self._init_backend()
+
+        # 注册全局热键
+        keyboard.add_hotkey('f8', self.trigger_single)
+        keyboard.add_hotkey('f9', self.trigger_loop)
+        keyboard.add_hotkey('esc', self.stop_loop)
+
+    def _build_ui(self):
+        # 1. 顶部：题库选择区
+        frame_top = tk.LabelFrame(self.root, text="题库设置", padx=8, pady=6)
+        frame_top.pack(fill="x", padx=10, pady=6)
+
+        tk.Entry(frame_top, textvariable=self.bank_file_path, width=38).pack(side="left", padx=(0, 6))
+        tk.Button(frame_top, text="浏览...", command=self.browse_file).pack(side="left", padx=2)
+        tk.Button(frame_top, text="重载", command=self.reload_bank).pack(side="left", padx=2)
+
+        # 2. 中部：选项配置区
+        frame_opt = tk.Frame(self.root)
+        frame_opt.pack(fill="x", padx=12, pady=2)
+
+        tk.Checkbutton(
+            frame_opt, text="窗口置顶", variable=self.topmost_var,
+            command=self.toggle_topmost
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Checkbutton(
+            frame_opt, text="全屏识别", variable=self.fullscreen_var
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Checkbutton(
+            frame_opt, text="自动点[提交]", variable=self.click_submit_var
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Checkbutton(
+            frame_opt, text="额外点[下一题]", variable=self.click_next_var
+        ).pack(side="left")
+
+        # 3. 核心：控制按钮区
+        frame_btn = tk.LabelFrame(self.root, text="答题控制 (支持按钮点击 & 快捷键)", padx=8, pady=8)
+        frame_btn.pack(fill="x", padx=10, pady=6)
+
+        self.btn_single = tk.Button(
+            frame_btn, text="🎯 单题解答 (F8)", bg="#e1f5fe", fg="#01579b",
+            font=("Microsoft YaHei", 10, "bold"), height=2, width=15,
+            command=self.trigger_single
+        )
+        self.btn_single.pack(side="left", expand=True, padx=4)
+
+        self.btn_loop = tk.Button(
+            frame_btn, text="🚀 自动连刷 (F9)", bg="#e8f5e9", fg="#1b5e20",
+            font=("Microsoft YaHei", 10, "bold"), height=2, width=15,
+            command=self.trigger_loop
+        )
+        self.btn_loop.pack(side="left", expand=True, padx=4)
+
+        self.btn_stop = tk.Button(
+            frame_btn, text="🛑 停止 (ESC)", bg="#ffebee", fg="#b71c1c",
+            font=("Microsoft YaHei", 10, "bold"), height=2, width=12,
+            state="disabled", command=self.stop_loop
+        )
+        self.btn_stop.pack(side="left", expand=True, padx=4)
+
+        # 4. 底部：实时运行日志区
+        frame_log = tk.LabelFrame(self.root, text="运行日志", padx=6, pady=6)
+        frame_log.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+
+        self.log_area = scrolledtext.ScrolledText(
+            frame_log, wrap=tk.WORD, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4"
+        )
+        self.log_area.pack(fill="both", expand=True)
+
+    def log(self, msg):
+        """线程安全的日志输出"""
+        def _append():
+            self.log_area.insert(tk.END, msg + "\n")
+            self.log_area.see(tk.END)
+        self.root.after(0, _append)
+
+    def toggle_topmost(self):
+        self.root.attributes("-topmost", self.topmost_var.get())
+
+    def browse_file(self):
+        path = filedialog.askopenfilename(
+            title="选择题库 txt 文件",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+        )
+        if path:
+            self.bank_file_path.set(path)
+            self.reload_bank()
+
+    def _init_backend(self):
+        def _load():
+            self.log("[*] 正在初始化 RapidOCR 引擎，请稍候...")
+            self.ocr = RapidOCR()
+            self.log("[+] OCR 引擎加载完成！")
+            self.reload_bank()
+        threading.Thread(target=_load, daemon=True).start()
+
+    def reload_bank(self):
+        filepath = self.bank_file_path.get()
+        if not os.path.exists(filepath):
+            self.log(f"[-] 找不到题库文件: {filepath}，请点击[浏览]选择！")
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = unicodedata.normalize('NFKC', f.read())
+        except UnicodeDecodeError:
+            with open(filepath, 'r', encoding='gbk', errors='ignore') as f:
+                content = unicodedata.normalize('NFKC', f.read())
+
+        blocks = content.split('----------------------------------------')
+        questions = []
+        current_chapter = "默认章节"
+
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            raw_lines = [line.strip() for line in block.split('\n') if line.strip()]
+
+            lines = []
+            for line in raw_lines:
+                if re.match(r'^第\s*\d+\s*讲', line):
+                    current_chapter = line
+                else:
+                    lines.append(line)
+
+            if len(lines) < 2:
+                continue
+
+            q_lines = []
+            opt_start_idx = 1
+            for idx, line in enumerate(lines):
+                if re.match(r'^([A-E]|true|false)[\.、\s]*', line, re.IGNORECASE) or line.startswith('参考答案'):
+                    opt_start_idx = idx
+                    break
+                q_lines.append(line)
+
+            raw_q = re.sub(r'^\d+[\.、\s]*', '', " ".join(q_lines))
+            options = {}
+            ans_list = []
+
+            for line in lines[opt_start_idx:]:
+                opt_match = re.match(r'^([A-E]|true|false)[\.、\s]*(.*)$', line, re.IGNORECASE)
+                if opt_match and not line.startswith('参考答案'):
+                    key = opt_match.group(1).upper()
+                    val = opt_match.group(2).strip()
+                    options[key] = val
+                elif line.startswith('参考答案：') or line.startswith('参考答案:'):
+                    ans_str = line.split('：')[-1].split(':')[-1].strip()
+                    if '✔' in ans_str or ans_str.upper() == 'TRUE' or ans_str == '正确':
+                        ans_list = ['TRUE']
+                    elif '❌' in ans_str or ans_str.upper() == 'FALSE' or ans_str == '错误':
+                        ans_list = ['FALSE']
+                    else:
+                        ans_list = [a.strip().upper() for a in ans_str.split(',') if a.strip()]
+
+            if not ans_list:
+                continue
+
+            target_texts = []
+            for ans in ans_list:
+                if ans == 'TRUE':
+                    target_texts.append(('正确', 'TRUE'))
+                elif ans == 'FALSE':
+                    target_texts.append(('错误', 'FALSE'))
+                elif ans in options:
+                    opt_val = options[ans]
+                    if opt_val.startswith('!['):
+                        target_texts.append(('', ans))
+                    else:
+                        target_texts.append((opt_val, ans))
+
+            questions.append({
+                'chapter': current_chapter,
+                'raw_q': raw_q,
+                'norm_q': normalize_text(raw_q),
+                'ans_list': ans_list,
+                'targets': target_texts
+            })
+
+        self.bank = questions
+        self.log(f"[+] 成功加载题库: 共 {len(self.bank)} 道题。")
+
+    def _get_capture_bbox(self):
+        """动态获取截图范围，适应任意分辨率屏幕"""
+        screen_w, screen_h = pyautogui.size()
+        if self.fullscreen_var.get():
+            return None, 0, 0
+        else:
+            left = int(screen_w * 0.25)
+            top = int(screen_h * 0.08)
+            bbox = (left, top, screen_w, screen_h)
+            return bbox, left, top
+
+    def _capture_ocr_items(self):
+        """隐藏自身窗口并执行截图与 OCR 识别"""
+        self.root.attributes("-alpha", 0.0)
+        time.sleep(0.15)
+        bbox, offset_x, offset_y = self._get_capture_bbox()
+        img = ImageGrab.grab(bbox=bbox)
+        self.root.attributes("-alpha", 1.0)
+
+        result, _ = self.ocr(img)
+        if not result:
+            return [], "", img, (offset_x, offset_y)
+
+        ocr_items = []
+        full_screen_norm = ""
+        for box, text, score in result:
+            norm_t = normalize_text(text)
+            left_x = int(box[0][0]) + offset_x
+            bottom_y = int(box[2][1]) + offset_y
+            center_x = int((box[0][0] + box[2][0]) / 2) + offset_x
+            center_y = int((box[0][1] + box[2][1]) / 2) + offset_y
+            ocr_items.append({
+                'raw': text.strip(),
+                'norm': norm_t,
+                'center': (center_x, center_y),
+                'left_bottom': (left_x, bottom_y)
+            })
+            full_screen_norm += norm_t
+        return ocr_items, full_screen_norm, img, (offset_x, offset_y)
+
+    def _find_true_false_circles(self, pil_img, offset, q_left_bottom):
+        """
+        针对并排圆圈图标 (✓) (×)：
+        1. 优先用 OpenCV 在题干正下方区域寻找两个并排的圆形按钮轮廓
+        2. 若未检出，则使用实测像素偏移：左圆勾 (+16, +58)，右圆叉 (+70, +58)
+        """
+        ox, oy = offset
+        bx, by = q_left_bottom
+
+        # 在截图内截取题干左下方区域 (宽 220px, 高 110px)
+        rx1 = max(0, bx - ox - 20)
+        ry1 = max(0, by - oy + 10)
+        rx2 = rx1 + 220
+        ry2 = ry1 + 110
+
+        roi = np.array(pil_img.crop((rx1, ry1, rx2, ry2)))
+        if roi.size > 0:
+            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+            # 提取浅灰色圆圈边缘
+            edges = cv2.Canny(gray, 30, 120)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            circles = []
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                # 圆圈直径约在 22~55 像素之间，且宽高比接近 1:1
+                if 22 <= w <= 55 and 22 <= h <= 55 and 0.75 <= w / float(h) <= 1.33:
+                    cx = rx1 + x + w // 2 + ox
+                    cy = ry1 + y + h // 2 + oy
+                    # 去重（防止内外圈重复记录）
+                    if not any(abs(cx - ex) < 18 and abs(cy - ey) < 18 for ex, ey in circles):
+                        circles.append((cx, cy))
+
+            # 按从左到右排序：左边第 1 个是勾(✓)，右边第 2 个是叉(×)
+            circles.sort(key=lambda p: p[0])
+            if len(circles) >= 2:
+                return circles[0], circles[1], "OpenCV圆圈识别"
+
+        # 实测像素兜底：勾在左 (bx+16, by+58)，叉在右 (bx+70, by+58)
+        true_pos = (bx + 16, by + 58)
+        false_pos = (bx + 70, by + 58)
+        return true_pos, false_pos, "题干末行像素定位"
+
+    def _click_submit(self):
+        """
+        选完选项后，“提交”按钮从浅灰色变为蓝色高亮。
+        此时重新扫描屏幕底部，根据用户勾选状态点击【提交】和【下一题】。
+        """
+        if not self.click_submit_var.get() and not self.click_next_var.get():
+            self.log("  [*] 已完成选项勾选（未开启自动提交）。")
+            return
+
+        time.sleep(0.4)  # 等待网页响应选中状态，“提交”按钮变蓝激活
+        self.log("  [*] 正在定位底部 [提交] 按钮...")
+        ocr_items, _, _, _ = self._capture_ocr_items()
+
+        submit_pos = None
+        prev_pos = None
+        next_pos = None
+
+        for item in ocr_items:
+            raw = item['raw'].replace(" ", "")
+            if "提交" in raw or "提" == raw:
+                submit_pos = item['center']
+            elif "上一题" in raw or "上一" in raw:
+                prev_pos = item['center']
+            elif "下一题" in raw or "下一" in raw:
+                next_pos = item['center']
+
+        # 仅当勾选了“自动点[提交]”时才执行提交点击
+        if self.click_submit_var.get():
+            if not submit_pos and prev_pos and next_pos:
+                submit_pos = (int((prev_pos[0] + next_pos[0]) / 2), int((prev_pos[1] + next_pos[1]) / 2))
+                self.log(f"  [*] 通过[上一题/下一题]中点推算出 [提交] 坐标: {submit_pos}")
+            elif not submit_pos and next_pos:
+                submit_pos = (next_pos[0] - 240, next_pos[1])
+                self.log(f"  [*] 通过[下一题]左侧偏移推算出 [提交] 坐标: {submit_pos}")
+
+            if submit_pos:
+                self.log(f"  -> 点击 [提交] @({submit_pos[0]}, {submit_pos[1]})，等待自动跳转下一题...")
+                pyautogui.click(submit_pos[0], submit_pos[1])
+            else:
+                self.log("  [!] 警告：未能找到 [提交] 按钮坐标！")
+
+        # 仅当用户在界面勾选了“额外点[下一题]”时才点击下一题
+        if self.click_next_var.get() and next_pos:
+            time.sleep(0.8)
+            self.log(f"  -> 额外点击 [下一题] @({next_pos[0]}, {next_pos[1]})")
+            pyautogui.click(next_pos[0], next_pos[1])
+
+    def solve_once(self):
+        if not self.ocr or not self.bank:
+            self.log("[!] OCR 尚未就绪或题库为空！")
+            return
+
+        self.log("\n[*] 正在截屏并执行 OCR 识别题目...")
+        ocr_items, full_screen_norm, pil_img, offset = self._capture_ocr_items()
+        if not ocr_items:
+            self.log("[-] 未识别到任何屏幕文字！")
+            return
+
+        best_match = None
+        best_score = 0
+
+        for item in self.bank:
+            q_norm = item['norm_q']
+            if not q_norm:
+                continue
+            if q_norm in full_screen_norm:
+                best_match = item
+                best_score = 1.0
+                break
+
+            for i, ocr_item in enumerate(ocr_items):
+                if len(ocr_item['norm']) < 4:
+                    continue
+                combined_norm = "".join([x['norm'] for x in ocr_items[i:i+3]])
+                score = max(similarity(q_norm, ocr_item['norm']), similarity(q_norm, combined_norm))
+                if score > best_score:
+                    best_score = score
+                    best_match = item
+
+        if not best_match or best_score < 0.45:
+            self.log(f"[-] 未匹配到题目 (最高相似度: {best_score:.2f})")
+            return
+
+        # 精确锁定题干在屏幕上的【最后一行】文字块（应对多行题干，同时获取第一行的左边界 X）
+        q_norm = best_match['norm_q']
+        q_matched_lines = [
+            it for it in ocr_items
+            if len(it['norm']) >= 2 and (it['norm'] in q_norm or q_norm in it['norm'])
+            and "判断题" not in it['raw'] and "单选题" not in it['raw'] and "多选题" not in it['raw']
+        ]
+        if q_matched_lines:
+            # X 取题干最左边的对齐线，Y 取题干最下面一行的底部
+            q_left_x = min(it['left_bottom'][0] for it in q_matched_lines)
+            q_bottom_y = max(it['left_bottom'][1] for it in q_matched_lines)
+            q_left_bottom = (q_left_x, q_bottom_y)
+        else:
+            q_left_bottom = (474, 302)
+
+        self.log(f"[+] 章节: {best_match['chapter']}")
+        self.log(f"[+] 题目: {best_match['raw_q'][:28]}... ({best_score:.2f})")
+        self.log(f"[+] 答案: {best_match['ans_list']}")
+
+        # 查找并点击选项
+        for target_text, ans_key in best_match['targets']:
+            norm_target = normalize_text(target_text)
+            clicked = False
+            delay_sec = random.uniform(0.3, 0.8)
+
+            # 1. 判断题专门处理：左边圆圈是勾(TRUE)，右边圆圈是叉(FALSE)
+            if ans_key in ('TRUE', 'FALSE'):
+                true_pos, false_pos, method = self._find_true_false_circles(pil_img, offset, q_left_bottom)
+                target_pos = true_pos if ans_key == 'TRUE' else false_pos
+                label = "左圆[勾 ✓]" if ans_key == 'TRUE' else "右圆[叉 ×]"
+                self.log(f"  -> ({method}) 点击 {label} @({target_pos[0]},{target_pos[1]})")
+                pyautogui.click(target_pos[0], target_pos[1])
+                time.sleep(delay_sec)
+                clicked = True
+
+            # 2. 单选/多选常规文字匹配
+            if not clicked and norm_target:
+                for ocr_item in ocr_items:
+                    if not ocr_item['norm']:
+                        continue
+                    if (norm_target == ocr_item['norm'] or
+                        (len(norm_target) >= 3 and norm_target in ocr_item['norm']) or
+                        (len(ocr_item['norm']) >= 3 and ocr_item['norm'] in norm_target) or
+                        similarity(norm_target, ocr_item['norm']) > 0.78):
+
+                        x, y = ocr_item['center']
+                        self.log(f"  -> 点击选项 [{ans_key}] ({target_text[:12]}) @({x},{y}) [间隔{delay_sec:.2f}s]")
+                        pyautogui.click(x, y)
+                        time.sleep(delay_sec)
+                        clicked = True
+                        break
+
+            # 3. 单选/多选字母框兜底（如纯图片选项题）
+            if not clicked:
+                for ocr_item in ocr_items:
+                    raw_upper = ocr_item['raw'].upper().strip('.、 ')
+                    if raw_upper == ans_key:
+                        x, y = ocr_item['center']
+                        self.log(f"  -> 点击字母框 [{ans_key}] @({x},{y}) [间隔{delay_sec:.2f}s]")
+                        pyautogui.click(x, y)
+                        time.sleep(delay_sec)
+                        clicked = True
+                        break
+
+            if not clicked:
+                self.log(f"  [!] 未找到选项 [{ans_key}] 的位置，请手动选择！")
+
+        # 选完选项后，执行提交判断
+        self._click_submit()
+
+    def trigger_single(self):
+        if self.is_running_loop:
+            return
+        threading.Thread(target=self.solve_once, daemon=True).start()
+
+    def trigger_loop(self):
+        if self.is_running_loop:
+            return
+        self.is_running_loop = True
+        self.btn_single.config(state="disabled")
+        self.btn_loop.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.log("\n[🚀] 开启连续自动答题模式 (点[停止]或按 ESC 中断)...")
+
+        def _loop_worker():
+            while self.is_running_loop:
+                self.solve_once()
+                # 等待网页提交后自动跳转到下一题（随机 1.6 ~ 2.4 秒）
+                for _ in range(random.randint(16, 24)):
+                    if not self.is_running_loop:
+                        break
+                    time.sleep(0.1)
+            self.log("[🛑] 已停止连续答题。")
+            self.root.after(0, self._reset_buttons)
+
+        threading.Thread(target=_loop_worker, daemon=True).start()
+
+    def stop_loop(self):
+        if self.is_running_loop:
+            self.is_running_loop = False
+
+    def _reset_buttons(self):
+        self.btn_single.config(state="normal")
+        self.btn_loop.config(state="normal")
+        self.btn_stop.config(state="disabled")
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = AutoAnswerApp(root)
+    root.mainloop()
